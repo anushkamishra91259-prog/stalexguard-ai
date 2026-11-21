@@ -11,20 +11,17 @@ st.set_page_config(
 )
 
 
-def get_gemini_key() -> str:
+def get_groq_key() -> str:
     try:
-        if "GEMINI_API_KEY" in st.secrets:
-            return str(st.secrets["GEMINI_API_KEY"]).strip()
+        if "GROQ_API_KEY" in st.secrets:
+            return str(st.secrets["GROQ_API_KEY"]).strip()
     except Exception:
         pass
-    return os.environ.get("GEMINI_API_KEY", "").strip()
+    return os.environ.get("GROQ_API_KEY", "").strip()
 
 
-def verify_claim_with_gemini(claim: str, api_key: str) -> dict:
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.5-flash:generateContent?key={api_key}"
-    )
+def verify_claim_with_groq(claim: str, api_key: str) -> dict:
+    url = "https://api.groq.com/openai/v1/chat/completions"
     prompt = (
         "Evaluate the factual accuracy and temporal freshness of this claim as of November 2026. "
         "Respond strictly as JSON with keys: verdict (string), freshness_score (integer 0-100), "
@@ -33,53 +30,60 @@ def verify_claim_with_gemini(claim: str, api_key: str) -> dict:
         f"Claim: {claim}"
     )
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json"},
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": "You are a precise claim freshness auditor that always responds with valid JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2,
     }
     req = request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "StaleGuardAI/1.0",
+        },
         method="POST",
     )
     with request.urlopen(req, timeout=25) as resp:
         raw = json.loads(resp.read().decode("utf-8"))
-    text = raw["candidates"][0]["content"]["parts"][0]["text"]
-    return json.loads(text)
+    content = raw["choices"][0]["message"]["content"]
+    return json.loads(content)
 
 
-gemini_key = get_gemini_key()
+groq_key = get_groq_key()
 index_path = Path(__file__).parent / "index.html"
 
 if index_path.exists():
     html_content = index_path.read_text(encoding="utf-8")
-    if gemini_key:
-        html_content = html_content.replace("__GEMINI_API_KEY__", gemini_key)
     components.html(html_content, height=900, scrolling=True)
 else:
     st.error("index.html repository mein nahi mili.")
 
 st.divider()
-st.subheader("Live Gemini Verification (Streamlit Cloud)")
+st.subheader("Live Verification (Streamlit Cloud + Groq)")
 
-if not gemini_key:
-    st.warning("Streamlit Secrets mein GEMINI_API_KEY set nahi hai. Manage app -> Settings -> Secrets mein daalein.")
+if not groq_key:
+    st.warning("Streamlit Secrets mein GROQ_API_KEY set nahi hai. Manage app -> Settings -> Secrets mein daalein.")
 
 claim_text = st.text_input(
     "Enter claim to verify",
-    value="red yellow makes green",
+    value="delhi is the capital of india",
     key="live_claim_input",
 )
 
-if st.button("Verify Claim with Gemini", type="primary"):
-    if not gemini_key:
-        st.error("Pehle Streamlit Secrets mein GEMINI_API_KEY add karein.")
+if st.button("Verify Claim Now", type="primary"):
+    if not groq_key:
+        st.error("Pehle Streamlit Secrets mein GROQ_API_KEY add karein.")
     elif not claim_text.strip():
         st.warning("Kripya claim likhein.")
     else:
-        with st.spinner("Verifying claim with Gemini..."):
+        with st.spinner("Verifying claim..."):
             try:
-                res = verify_claim_with_gemini(claim_text.strip(), gemini_key)
+                res = verify_claim_with_groq(claim_text.strip(), groq_key)
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Freshness Score", f"{res.get('freshness_score', 'N/A')}%")
                 c2.metric("Verdict", str(res.get("verdict", "N/A")))
@@ -88,6 +92,6 @@ if st.button("Verify Claim with Gemini", type="primary"):
                 with st.expander("Full JSON Output"):
                     st.json(res)
             except error.HTTPError as e:
-                st.error(f"Gemini API HTTP Error {e.code}: {e.read().decode('utf-8', errors='ignore')}")
+                st.error(f"Groq API HTTP Error {e.code}: {e.read().decode('utf-8', errors='ignore')}")
             except Exception as e:
                 st.error(f"Error: {e}")
