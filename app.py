@@ -66,7 +66,7 @@ if not gemini_key:
 
 claim_input = st.text_input(
     "Claim for direct Gemini check",
-    value="sun rises from east",
+    value="delhi is the capital of india",
     placeholder="Enter a claim to verify...",
 )
 if st.button("Verify with Gemini Now"):
@@ -81,4 +81,4 @@ if st.button("Verify with Gemini Now"):
         except error.HTTPError as e:
             st.error(f"Gemini API HTTP Error {e.code}: {e.read().decode('utf-8', errors='ignore')}")
         except Exception as e:
-            st.error(f"Verification error: {e}")
+            st.error(f"Verification error: {e}") 
