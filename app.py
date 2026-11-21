@@ -55,30 +55,39 @@ if index_path.exists():
     html_content = index_path.read_text(encoding="utf-8")
     if gemini_key:
         html_content = html_content.replace("__GEMINI_API_KEY__", gemini_key)
-    components.html(html_content, height=950, scrolling=True)
+    components.html(html_content, height=900, scrolling=True)
 else:
     st.error("index.html repository mein nahi mili.")
 
 st.divider()
-st.subheader("Direct Gemini Live Check (Streamlit Backend)")
-if not gemini_key:
-    st.warning("GEMINI_API_KEY Streamlit Secrets mein set nahi mili.")
+st.subheader("Live Gemini Verification (Streamlit Cloud)")
 
-claim_input = st.text_input(
-    "Claim for direct Gemini check",
-    value="delhi is the capital of india",
-    placeholder="Enter a claim to verify...",
+if not gemini_key:
+    st.warning("Streamlit Secrets mein GEMINI_API_KEY set nahi hai. Manage app -> Settings -> Secrets mein daalein.")
+
+claim_text = st.text_input(
+    "Enter claim to verify",
+    value="red yellow makes green",
+    key="live_claim_input",
 )
-if st.button("Verify with Gemini Now"):
+
+if st.button("Verify Claim with Gemini", type="primary"):
     if not gemini_key:
         st.error("Pehle Streamlit Secrets mein GEMINI_API_KEY add karein.")
-    elif not claim_input.strip():
-        st.warning("Kripya pehle koi claim likhein.")
+    elif not claim_text.strip():
+        st.warning("Kripya claim likhein.")
     else:
-        try:
-            result = verify_claim_with_gemini(claim_input.strip(), gemini_key)
-            st.json(result)
-        except error.HTTPError as e:
-            st.error(f"Gemini API HTTP Error {e.code}: {e.read().decode('utf-8', errors='ignore')}")
-        except Exception as e:
-            st.error(f"Verification error: {e}") 
+        with st.spinner("Verifying claim with Gemini..."):
+            try:
+                res = verify_claim_with_gemini(claim_text.strip(), gemini_key)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Freshness Score", f"{res.get('freshness_score', 'N/A')}%")
+                c2.metric("Verdict", str(res.get("verdict", "N/A")))
+                c3.metric("Temporal Freshness", str(res.get("temporal_freshness", "N/A")))
+                st.write("**Summary:**", res.get("summary", ""))
+                with st.expander("Full JSON Output"):
+                    st.json(res)
+            except error.HTTPError as e:
+                st.error(f"Gemini API HTTP Error {e.code}: {e.read().decode('utf-8', errors='ignore')}")
+            except Exception as e:
+                st.error(f"Error: {e}")
