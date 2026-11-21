@@ -20,7 +20,31 @@ def get_groq_key() -> str:
     return os.environ.get("GROQ_API_KEY", "").strip()
 
 
-def verify_claim_with_groq(claim: str, api_key: str) -> dict:
+def fetch_available_groq_models(api_key: str) -> list[str]:
+    url = "https://api.groq.com/openai/v1/models"
+    req = request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "StaleGuardAI/1.0",
+        },
+        method="GET",
+    )
+    with request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    models = []
+    for item in data.get("data", []):
+        model_id = str(item.get("id", "")).strip()
+        if not model_id:
+            continue
+        lower_id = model_id.lower()
+        if any(skip in lower_id for skip in ("whisper", "distil-whisper", "guard", "tts", "playai")):
+            continue
+        models.append(model_id)
+    return models
+
+
+def call_groq_model(claim: str, api_key: str, model_name: str) -> dict:
     url = "https://api.groq.com/openai/v1/chat/completions"
     prompt = (
         "Evaluate the factual accuracy and temporal freshness of this claim as of November 2026. "
@@ -30,9 +54,12 @@ def verify_claim_with_groq(claim: str, api_key: str) -> dict:
         f"Claim: {claim}"
     )
     payload = {
-        "model": "llama-3.3-70b-versatile",
+        "model": model_name,
         "messages": [
-            {"role": "system", "content": "You are a precise claim freshness auditor that always responds with valid JSON."},
+            {
+                "role": "system",
+                "content": "You are a precise claim freshness auditor that always responds with valid JSON.",
+            },
             {"role": "user", "content": prompt},
         ],
         "response_format": {"type": "json_object"},
@@ -51,7 +78,27 @@ def verify_claim_with_groq(claim: str, api_key: str) -> dict:
     with request.urlopen(req, timeout=25) as resp:
         raw = json.loads(resp.read().decode("utf-8"))
     content = raw["choices"][0]["message"]["content"]
-    return json.loads(content)
+    parsed = json.loads(content)
+    parsed["_model_used"] = model_name
+    return parsed
+
+
+def verify_claim_with_groq(claim: str, api_key: str) -> dict:
+    models = fetch_available_groq_models(api_key)
+    if not models:
+        raise RuntimeError("Groq account par koi chat model list nahi hua.")
+
+    last_err = None
+    for model_name in models[:6]:
+        try:
+            return call_groq_model(claim, api_key, model_name)
+        except error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="ignore")
+            last_err = RuntimeError(f"Groq API HTTP Error {e.code} ({model_name}): {body}")
+            if e.code in (400, 404):
+                continue
+            raise last_err
+    raise last_err or RuntimeError("Kisi bhi available Groq model se response nahi aaya.")
 
 
 groq_key = get_groq_key()
@@ -89,9 +136,8 @@ if st.button("Verify Claim Now", type="primary"):
                 c2.metric("Verdict", str(res.get("verdict", "N/A")))
                 c3.metric("Temporal Freshness", str(res.get("temporal_freshness", "N/A")))
                 st.write("**Summary:**", res.get("summary", ""))
+                st.caption(f"Model used: {res.get('_model_used', 'N/A')}")
                 with st.expander("Full JSON Output"):
                     st.json(res)
-            except error.HTTPError as e:
-                st.error(f"Groq API HTTP Error {e.code}: {e.read().decode('utf-8', errors='ignore')}")
             except Exception as e:
                 st.error(f"Error: {e}")
