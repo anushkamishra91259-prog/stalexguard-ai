@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 from urllib import error, request
 import streamlit as st
@@ -47,13 +48,13 @@ def fetch_available_groq_models(api_key: str) -> list[str]:
 def call_groq_model(claim: str, api_key: str, model_name: str) -> dict:
     url = "https://api.groq.com/openai/v1/chat/completions"
     prompt = (
-        "Check if the following claim is factually TRUE or FALSE as of November 2026. "
-        "Be strict and accurate: if the claim is false or incorrect, set is_true to false and verdict to 'FALSE'. "
-        "If the claim is factually true, set is_true to true and verdict to 'TRUE'. "
-        "Respond strictly as JSON with keys: is_true (boolean), verdict (string: 'TRUE' or 'FALSE'), "
-        "freshness_score (integer 0-100), truthfulness (string: 'VERIFIED TRUE' or 'FALSE CLAIM'), "
-        "temporal_freshness (string), evidence_confidence (string), "
-        "hallucination_risk (string), and summary (string).\n\n"
+        "You are a strict factual truth checker. Evaluate ONLY the statement given in Claim.\n"
+        "Rules:\n"
+        "1. If the statement is factually FALSE, wrong, or negated falsely (for example: 'delhi is not the capital of india', 'dogs baby is kitten', '2 + 2 = 5'), "
+        "you MUST set is_true = false, verdict = 'FALSE', truthfulness = 'FALSE CLAIM', and freshness_score = 10.\n"
+        "2. If the statement is factually TRUE and accurate (for example: 'delhi is the capital of india', 'dogs baby is puppy', 'cows baby is calf'), "
+        "you MUST set is_true = true, verdict = 'TRUE', truthfulness = 'VERIFIED TRUE', and freshness_score = 95.\n"
+        "Return strictly valid JSON with keys: is_true, verdict, freshness_score, truthfulness, summary.\n\n"
         f"Claim: {claim}"
     )
     payload = {
@@ -61,7 +62,7 @@ def call_groq_model(claim: str, api_key: str, model_name: str) -> dict:
         "messages": [
             {
                 "role": "system",
-                "content": "You are a strict, accurate fact-checker. Carefully distinguish TRUE claims from FALSE claims and return valid JSON.",
+                "content": "You are a strict fact-checker. Never output TRUE for a false statement. Always return valid JSON.",
             },
             {"role": "user", "content": prompt},
         ],
@@ -83,21 +84,23 @@ def call_groq_model(claim: str, api_key: str, model_name: str) -> dict:
     content = raw["choices"][0]["message"]["content"]
     parsed = json.loads(content)
 
-    # Normalize is_true strictly from boolean or verdict string
     raw_is_true = parsed.get("is_true")
     raw_verdict = str(parsed.get("verdict", "")).strip().upper()
     if isinstance(raw_is_true, bool):
         strict_true = raw_is_true
     elif raw_verdict in ("TRUE", "VERIFIED TRUE", "FACTUAL"):
         strict_true = True
-    elif raw_verdict in ("FALSE", "FALSE CLAIM", "INCORRECT", "FABRICATED"):
-        strict_true = False
     else:
         strict_true = False
 
     parsed["is_true"] = strict_true
     parsed["verdict"] = "TRUE" if strict_true else "FALSE"
     parsed["truthfulness"] = "VERIFIED TRUE" if strict_true else "FALSE CLAIM"
+
+    score = parsed.get("freshness_score")
+    if not isinstance(score, int):
+        score = 95 if strict_true else 10
+    parsed["freshness_score"] = max(0, min(100, int(score)))
     parsed["_model_used"] = model_name
     return parsed
 
@@ -122,26 +125,30 @@ def verify_claim_with_groq(claim: str, api_key: str) -> dict:
 
 def inject_result_into_html(html_str: str, claim: str, res: dict) -> str:
     is_true = bool(res.get("is_true", False))
-    status_label = "TRUE" if is_true else "FALSE"
-    truth_label = "VERIFIED TRUE" if is_true else "FALSE CLAIM"
+    verdict_text = "TRUE" if is_true else "FALSE"
+    truth_text = "VERIFIED TRUE" if is_true else "FALSE CLAIM"
     score = res.get("freshness_score", 95 if is_true else 10)
     summary = str(res.get("summary", "")).replace('"', "&quot;").replace("'", "&#39;")
     safe_claim = claim.replace('"', "&quot;").replace("'", "&#39;")
 
-    # Replace only the exact verification placeholder strings (not global words like LOW/UNKNOWN)
-    updated = html_str.replace("UNVERIFIED / AWAITING EVIDENCE", status_label)
-    updated = updated.replace("Verification Pending", truth_label)
+    updated = re.sub(r"35\s*%", f"{score}%", html_str)
+    updated = updated.replace("UNVERIFIED / AWAITING EVIDENCE", verdict_text)
+    updated = updated.replace("Verification Pending", truth_text)
     updated = updated.replace(
         "Claim is being cross-referenced against authoritative multi-source registries.",
         summary,
     )
 
+    if not is_true:
+        updated = updated.replace("VERIFIED TRUE", "FALSE CLAIM")
+
     sync_script = f"""
     <script>
     (function() {{
       const claimVal = "{safe_claim}";
-      const verdictText = "{status_label}";
-      const truthText = "{truth_label}";
+      const isTrue = {str(is_true).lower()};
+      const verdictText = "{verdict_text}";
+      const truthText = "{truth_text}";
       const scoreText = "{score}%";
       const summaryText = "{summary}";
 
@@ -158,9 +165,15 @@ def inject_result_into_html(html_str: str, claim: str, res: dict) -> str:
             const t = node.textContent.trim();
             if (t === "UNVERIFIED / AWAITING EVIDENCE" || t === "UNVERIFIED") {{
               node.textContent = verdictText;
-            }} else if (t === "Verification Pending") {{
+            }} else if (t === "Verification Pending" || t === "VERIFIED TRUE" || t === "FALSE CLAIM") {{
               node.textContent = truthText;
-            }} else if (t === "35%") {{
+            }} else if (t === "TRUE" || t === "FALSE") {{
+              if (!isTrue && t === "TRUE") {{
+                node.textContent = "FALSE";
+              }} else if (isTrue && t === "FALSE") {{
+                node.textContent = "TRUE";
+              }}
+            }} else if (/^35\\s*%$/.test(t)) {{
               node.textContent = scoreText;
             }} else if (t === "Claim is being cross-referenced against authoritative multi-source registries.") {{
               node.textContent = summaryText || truthText;
@@ -190,7 +203,7 @@ if "latest_verification" not in st.session_state:
 st.subheader("Live Claim Check (TRUE / FALSE via Groq)")
 claim_text = st.text_input(
     "Enter claim to verify",
-    value="dogs baby is puppy",
+    value="delhi is not the capital of india",
     key="live_claim_input",
 )
 
