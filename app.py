@@ -47,12 +47,13 @@ def fetch_available_groq_models(api_key: str) -> list[str]:
 def call_groq_model(claim: str, api_key: str, model_name: str) -> dict:
     url = "https://api.groq.com/openai/v1/chat/completions"
     prompt = (
-        "You are a factual claim checker as of November 2026. Decide decisively whether the claim is TRUE or FALSE "
-        "(do not say Unverified or Awaiting Evidence for clear factual claims). "
+        "Check if the following claim is factually TRUE or FALSE as of November 2026. "
+        "Be strict and accurate: if the claim is false or incorrect, set is_true to false and verdict to 'FALSE'. "
+        "If the claim is factually true, set is_true to true and verdict to 'TRUE'. "
         "Respond strictly as JSON with keys: is_true (boolean), verdict (string: 'TRUE' or 'FALSE'), "
         "freshness_score (integer 0-100), truthfulness (string: 'VERIFIED TRUE' or 'FALSE CLAIM'), "
-        "temporal_freshness (string), evidence_confidence (string: 'HIGH'), "
-        "hallucination_risk (string: 'LOW' or 'HIGH'), and summary (string).\n\n"
+        "temporal_freshness (string), evidence_confidence (string), "
+        "hallucination_risk (string), and summary (string).\n\n"
         f"Claim: {claim}"
     )
     payload = {
@@ -60,12 +61,12 @@ def call_groq_model(claim: str, api_key: str, model_name: str) -> dict:
         "messages": [
             {
                 "role": "system",
-                "content": "You are a decisive fact-checking engine. Always return valid JSON with clear TRUE or FALSE verdicts.",
+                "content": "You are a strict, accurate fact-checker. Carefully distinguish TRUE claims from FALSE claims and return valid JSON.",
             },
             {"role": "user", "content": prompt},
         ],
         "response_format": {"type": "json_object"},
-        "temperature": 0.1,
+        "temperature": 0.0,
     }
     req = request.Request(
         url,
@@ -81,6 +82,22 @@ def call_groq_model(claim: str, api_key: str, model_name: str) -> dict:
         raw = json.loads(resp.read().decode("utf-8"))
     content = raw["choices"][0]["message"]["content"]
     parsed = json.loads(content)
+
+    # Normalize is_true strictly from boolean or verdict string
+    raw_is_true = parsed.get("is_true")
+    raw_verdict = str(parsed.get("verdict", "")).strip().upper()
+    if isinstance(raw_is_true, bool):
+        strict_true = raw_is_true
+    elif raw_verdict in ("TRUE", "VERIFIED TRUE", "FACTUAL"):
+        strict_true = True
+    elif raw_verdict in ("FALSE", "FALSE CLAIM", "INCORRECT", "FABRICATED"):
+        strict_true = False
+    else:
+        strict_true = False
+
+    parsed["is_true"] = strict_true
+    parsed["verdict"] = "TRUE" if strict_true else "FALSE"
+    parsed["truthfulness"] = "VERIFIED TRUE" if strict_true else "FALSE CLAIM"
     parsed["_model_used"] = model_name
     return parsed
 
@@ -104,51 +121,60 @@ def verify_claim_with_groq(claim: str, api_key: str) -> dict:
 
 
 def inject_result_into_html(html_str: str, claim: str, res: dict) -> str:
-    is_true = bool(res.get("is_true", str(res.get("verdict", "")).strip().upper() == "TRUE"))
+    is_true = bool(res.get("is_true", False))
     status_label = "TRUE" if is_true else "FALSE"
     truth_label = "VERIFIED TRUE" if is_true else "FALSE CLAIM"
     score = res.get("freshness_score", 95 if is_true else 10)
-    summary = str(res.get("summary", "")).replace('"', "&quot;")
-    safe_claim = claim.replace('"', "&quot;")
+    summary = str(res.get("summary", "")).replace('"', "&quot;").replace("'", "&#39;")
+    safe_claim = claim.replace('"', "&quot;").replace("'", "&#39;")
 
-    updated = html_str.replace("35%", f"{score}%")
-    updated = updated.replace("UNVERIFIED / AWAITING EVIDENCE", status_label)
+    # Replace only the exact verification placeholder strings (not global words like LOW/UNKNOWN)
+    updated = html_str.replace("UNVERIFIED / AWAITING EVIDENCE", status_label)
     updated = updated.replace("Verification Pending", truth_label)
-    updated = updated.replace("UNVERIFIED", truth_label)
     updated = updated.replace(
         "Claim is being cross-referenced against authoritative multi-source registries.",
         summary,
     )
-    updated = updated.replace("UNKNOWN", "CURRENT" if is_true else "INCORRECT")
-    updated = updated.replace("LOW", "HIGH" if is_true else "VERIFIED")
 
     sync_script = f"""
     <script>
     (function() {{
       const claimVal = "{safe_claim}";
-      const statusText = "{status_label}";
+      const verdictText = "{status_label}";
+      const truthText = "{truth_label}";
       const scoreText = "{score}%";
       const summaryText = "{summary}";
-      window.addEventListener("DOMContentLoaded", () => {{
+
+      function applyVerdictToDom() {{
         document.querySelectorAll("textarea, input[type='text']").forEach(el => {{
-          if (!el.value || el.value.trim().length > 0) {{
+          if (el.value !== undefined) {{
             el.value = claimVal;
             el.dispatchEvent(new Event("input", {{ bubbles: true }}));
           }}
         }});
+
         document.querySelectorAll("*").forEach(node => {{
           if (node.children.length === 0 && node.textContent) {{
             const t = node.textContent.trim();
             if (t === "UNVERIFIED / AWAITING EVIDENCE" || t === "UNVERIFIED") {{
-              node.textContent = statusText;
+              node.textContent = verdictText;
             }} else if (t === "Verification Pending") {{
-              node.textContent = summaryText || statusText;
+              node.textContent = truthText;
             }} else if (t === "35%") {{
               node.textContent = scoreText;
+            }} else if (t === "Claim is being cross-referenced against authoritative multi-source registries.") {{
+              node.textContent = summaryText || truthText;
             }}
           }}
         }});
-      }});
+      }}
+
+      if (document.readyState === "loading") {{
+        document.addEventListener("DOMContentLoaded", applyVerdictToDom);
+      }} else {{
+        applyVerdictToDom();
+      }}
+      setTimeout(applyVerdictToDom, 400);
     }})();
     </script>
     """
