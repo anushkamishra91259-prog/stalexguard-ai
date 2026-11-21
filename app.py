@@ -11,6 +11,14 @@ st.set_page_config(
     layout="wide",
 )
 
+PREFERRED_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3-32b",
+    "moonshotai/kimi-k2-instruct",
+]
+
 
 def get_groq_key() -> str:
     try:
@@ -33,28 +41,36 @@ def fetch_available_groq_models(api_key: str) -> list[str]:
     )
     with request.urlopen(req, timeout=20) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-    models = []
+
+    available = []
     for item in data.get("data", []):
         model_id = str(item.get("id", "")).strip()
         if not model_id:
             continue
         lower_id = model_id.lower()
-        if any(skip in lower_id for skip in ("whisper", "distil-whisper", "guard", "tts", "playai")):
+        if any(skip in lower_id for skip in ("whisper", "guard", "tts", "playai", "embed", "prompt-guard")):
             continue
-        models.append(model_id)
-    return models
+        available.append(model_id)
+
+    ordered = [m for m in PREFERRED_MODELS if m in available]
+    for m in available:
+        if m not in ordered:
+            ordered.append(m)
+    return ordered
 
 
 def call_groq_model(claim: str, api_key: str, model_name: str) -> dict:
     url = "https://api.groq.com/openai/v1/chat/completions"
     prompt = (
-        "You are a strict factual truth checker. Evaluate ONLY the statement given in Claim.\n"
-        "Rules:\n"
-        "1. If the statement is factually FALSE, wrong, or negated falsely (for example: 'delhi is not the capital of india', 'dogs baby is kitten', '2 + 2 = 5'), "
-        "you MUST set is_true = false, verdict = 'FALSE', truthfulness = 'FALSE CLAIM', and freshness_score = 10.\n"
-        "2. If the statement is factually TRUE and accurate (for example: 'delhi is the capital of india', 'dogs baby is puppy', 'cows baby is calf'), "
-        "you MUST set is_true = true, verdict = 'TRUE', truthfulness = 'VERIFIED TRUE', and freshness_score = 95.\n"
-        "Return strictly valid JSON with keys: is_true, verdict, freshness_score, truthfulness, summary.\n\n"
+        "You are an accurate, objective fact-checker as of November 2026.\n"
+        "Carefully analyze the exact statement in Claim.\n"
+        "- Mark is_true = true ONLY if the statement is factually accurate and not false/misleading.\n"
+        "- Mark is_true = false if the statement is factually false, incorrect, or falsely negated.\n"
+        "- Never guess randomly; explain the exact real-world fact clearly and concisely in summary.\n"
+        "- Set freshness_score to an integer from 0 to 100 reflecting factual accuracy & freshness.\n\n"
+        "Respond strictly as JSON with keys:\n"
+        "is_true (boolean), verdict ('TRUE' or 'FALSE'), freshness_score (integer 0-100), "
+        "truthfulness ('VERIFIED TRUE' or 'FALSE CLAIM'), summary (string).\n\n"
         f"Claim: {claim}"
     )
     payload = {
@@ -62,7 +78,7 @@ def call_groq_model(claim: str, api_key: str, model_name: str) -> dict:
         "messages": [
             {
                 "role": "system",
-                "content": "You are a strict fact-checker. Never output TRUE for a false statement. Always return valid JSON.",
+                "content": "You are a strict, accurate fact-checker. Always return valid JSON.",
             },
             {"role": "user", "content": prompt},
         ],
@@ -98,9 +114,11 @@ def call_groq_model(claim: str, api_key: str, model_name: str) -> dict:
     parsed["truthfulness"] = "VERIFIED TRUE" if strict_true else "FALSE CLAIM"
 
     score = parsed.get("freshness_score")
-    if not isinstance(score, int):
-        score = 95 if strict_true else 10
-    parsed["freshness_score"] = max(0, min(100, int(score)))
+    try:
+        score_int = int(score)
+    except Exception:
+        score_int = 95 if strict_true else 10
+    parsed["freshness_score"] = max(0, min(100, score_int))
     parsed["_model_used"] = model_name
     return parsed
 
@@ -117,7 +135,7 @@ def verify_claim_with_groq(claim: str, api_key: str) -> dict:
         except error.HTTPError as e:
             body = e.read().decode("utf-8", errors="ignore")
             last_err = RuntimeError(f"Groq API HTTP Error {e.code} ({model_name}): {body}")
-            if e.code in (400, 404):
+            if e.code in (400, 404, 429):
                 continue
             raise last_err
     raise last_err or RuntimeError("Kisi bhi available Groq model se response nahi aaya.")
@@ -138,7 +156,6 @@ def inject_result_into_html(html_str: str, claim: str, res: dict) -> str:
         "Claim is being cross-referenced against authoritative multi-source registries.",
         summary,
     )
-
     if not is_true:
         updated = updated.replace("VERIFIED TRUE", "FALSE CLAIM")
 
@@ -203,7 +220,7 @@ if "latest_verification" not in st.session_state:
 st.subheader("Live Claim Check (TRUE / FALSE via Groq)")
 claim_text = st.text_input(
     "Enter claim to verify",
-    value="delhi is not the capital of india",
+    value="delhi is the capital of india",
     key="live_claim_input",
 )
 
